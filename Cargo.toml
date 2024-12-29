@@ -1,0 +1,12 @@
+[package]
+name = "scut-drcom-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = "4.5.23"
+hex = "0.4.3"
+log = "0.4.22"
+md5 = "0.7.0"
+pcap = "2.2.0"
+smoltcp = "0.12.0"
