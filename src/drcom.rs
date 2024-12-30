@@ -2,14 +2,54 @@ use log::{info, warn, error, debug};
 use std::net::Ipv4Addr;
 use md5::Digest;
 
-use crate::eap;
+use crate::{auth, eap};
 
-#[repr(u8)]
-pub enum DrcomType {
-    MISC_0800 = 0x08,
-    ALIVE_FILE = 0x10,
-    MISC_3000 = 0x30,
-    MISC_2800 = 0x28,
+#[derive(Debug, Clone, Copy)]
+pub enum AuthType {
+    StartAlive = 0x01,
+    ResponseForAlive = 0x02,
+    Info = 0x03,
+    ResponseInfo = 0x04,
+    HeartBeat = 0x0b,
+    ResponseHeartBeat = 0x06,
+    Unknown,
+}
+
+impl From<u8> for AuthType {
+    fn from(val: u8) -> Self {
+        match val {
+            0x01 => AuthType::StartAlive,
+            0x02 => AuthType::ResponseForAlive,
+            0x03 => AuthType::Info,
+            0x04 => AuthType::ResponseInfo,
+            0x0b => AuthType::HeartBeat,
+            0x06 => AuthType::ResponseHeartBeat,
+            _ => AuthType::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MiscType {
+    HeartBeat01Type = 0x01,
+    HeartBeat02Type = 0x02,
+    HeartBeat03Type = 0x03,
+    HeartBeat04Type = 0x04,
+    FileType = 0x06,
+    Unknown,
+}
+
+impl From<u8> for MiscType {
+    fn from(val: u8) -> Self {
+        match val {
+            0x01 => MiscType::HeartBeat01Type,
+            0x02 => MiscType::HeartBeat02Type,
+            0x03 => MiscType::HeartBeat03Type,
+            0x04 => MiscType::HeartBeat04Type,
+            0x06 => MiscType::FileType,
+            _ => MiscType::Unknown,
+        }
+    }
 }
 
 pub fn crc32(data: &[u8]) -> u32 {
@@ -47,19 +87,25 @@ pub fn encrypt_info(info: &mut [u8; 16]) {
     info.copy_from_slice(&chartmp);
 }
 
-pub fn misc_start_alive_setter(send_data: &mut [u8], _recv_data: &[u8]) -> usize {
+/// UDP MISC_START_ALIVE
+pub fn misc_start_alive_setter(send_data: &mut [u8]) -> usize {
     let data = [0x07, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00];
     send_data[..data.len()].copy_from_slice(&data);
     data.len()
 }
 
+pub fn misc_start_alive_setter_immediate() -> [u8; 8] {
+    return [0x07, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00];
+}
+
+/// UDP MISC_RESPONSE_FOR_ALIVE
 pub fn misc_info_setter(
     send_data: &mut [u8],
     recv_data: &[u8],
     crc_md5_info: &mut [u8; 16],
     username: &str, 
     hostname: &str,
-    mac: &[u8; 6], 
+    mac: &[u8], 
     local_ipaddr: Ipv4Addr,
     dns_ipaddr: Ipv4Addr, 
     version: &[u8], 
@@ -142,9 +188,8 @@ pub fn misc_info_setter(
     packetlen += 4;
 
     // 64 bytes version
-    send_data[packetlen..packetlen + 64].copy_from_slice(&[0x00; 64]); // fill 0x00
     send_data[packetlen..packetlen + version.len()].copy_from_slice(version);
-    packetlen += 64;
+    packetlen += version.len();
 
     // 68 bytes hash
     send_data[packetlen..packetlen + 68].copy_from_slice(&[0x00; 68]); // fill 0x00
@@ -192,6 +237,19 @@ pub fn misc_heart_beat_01_type_setter(send_data: &mut [u8], drcom_package_id: &m
     return 40;
 }
 
+pub fn misc_heart_beat_01_type_immediate(
+    drcom_package_id: &mut u8, 
+    drcom_misc1_flux: &[u8; 4]
+) -> [u8; 40] {
+    let mut send_data = [0u8; 40];
+    send_data[0] = 0x07;
+    send_data[1] = *drcom_package_id;
+    *drcom_package_id += 1;
+    send_data[2..8].copy_from_slice(&[0x28, 0x00, 0x0b, 0x01, 0xdc, 0x02]);
+    send_data[16..20].copy_from_slice(drcom_misc1_flux);
+    return send_data;
+}
+
 pub fn misc_heart_beat_03_type_setter(send_data: &mut [u8], recv_data: &[u8], drcom_package_id: &mut u8, local_ipaddr: Ipv4Addr) -> usize {
     let mut packetlen = 0;
     send_data[..40].fill(0);
@@ -218,7 +276,23 @@ pub fn misc_heart_beat_03_type_setter(send_data: &mut [u8], recv_data: &[u8], dr
     return 40;
 }
 
+pub fn misc_heart_beat_03_type_immediate(
+    recv_data: &[u8],
+    drcom_package_id: &mut u8, 
+    local_ipaddr: Ipv4Addr
+) -> [u8; 40] {
+    let mut send_data = [0u8; 40];
+    send_data[0] = 0x07;
+    send_data[1] = *drcom_package_id;
+    *drcom_package_id += 1;
+    send_data[2..8].copy_from_slice(&[0x28, 0x00, 0x0b, 0x03, 0xdc, 0x02]);
+    send_data[16..20].copy_from_slice(&recv_data[16..20]);
+    send_data[28..32].copy_from_slice(&local_ipaddr.octets());
+    return send_data;
+}
+
 pub fn alive_heart_beat_type_setter(send_data: &mut [u8], crc_md5_info: &[u8; 16], tailinfo: &[u8; 16]) -> usize {
+    send_data.fill(0);
     let mut packetlen = 0;
     send_data[packetlen] = 0xff;
     packetlen += 1;
