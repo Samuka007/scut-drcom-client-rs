@@ -69,7 +69,7 @@ pub fn crc32(data: &[u8]) -> u32 {
     }
 
     ret = ret.to_le();
-    ret = (ret.wrapping_mul(19680126)) & 0xFFFFFFFF;
+    ret = ret.wrapping_mul(19680126);
     ret = ret.to_le();
 
     ret
@@ -91,7 +91,7 @@ pub fn misc_start_alive_setter(send_data: &mut [u8]) -> usize {
 }
 
 pub fn misc_start_alive_setter_immediate() -> [u8; 8] {
-    return [0x07, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00];
+    [0x07, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00]
 }
 
 /// UDP MISC_RESPONSE_FOR_ALIVE
@@ -230,7 +230,7 @@ pub fn misc_heart_beat_01_type_setter(send_data: &mut [u8], drcom_package_id: &m
     // don't know what 11..15 is
     send_data[16..20].copy_from_slice(drcom_misc1_flux);
     // so as 20..40 ...
-    return 40;
+    40
 }
 
 pub fn misc_heart_beat_01_type_immediate(
@@ -243,7 +243,7 @@ pub fn misc_heart_beat_01_type_immediate(
     *drcom_package_id += 1;
     send_data[2..8].copy_from_slice(&[0x28, 0x00, 0x0b, 0x01, 0xdc, 0x02]);
     send_data[16..20].copy_from_slice(drcom_misc1_flux);
-    return send_data;
+    send_data
 }
 
 pub fn misc_heart_beat_03_type_setter(send_data: &mut [u8], recv_data: &[u8], drcom_package_id: &mut u8, local_ipaddr: Ipv4Addr) -> usize {
@@ -269,7 +269,7 @@ pub fn misc_heart_beat_03_type_setter(send_data: &mut [u8], recv_data: &[u8], dr
 
     send_data[28..32].copy_from_slice(&local_ipaddr.octets());
     
-    return 40;
+    40
 }
 
 pub fn misc_heart_beat_03_type_immediate(
@@ -284,7 +284,7 @@ pub fn misc_heart_beat_03_type_immediate(
     send_data[2..8].copy_from_slice(&[0x28, 0x00, 0x0b, 0x03, 0xdc, 0x02]);
     send_data[16..20].copy_from_slice(&recv_data[16..20]);
     send_data[28..32].copy_from_slice(&local_ipaddr.octets());
-    return send_data;
+    send_data
 }
 
 pub fn alive_heart_beat_type_setter(send_data: &mut [u8], crc_md5_info: &[u8; 16], tailinfo: &[u8; 16]) -> usize {

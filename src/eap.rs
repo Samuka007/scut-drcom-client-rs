@@ -1,6 +1,11 @@
 use std::net::Ipv4Addr;
 
-use smoltcp::wire::{EthernetAddress, EthernetFrame};
+// use smoltcp::wire::{EthernetAddress, EthernetFrame};
+use pnet::packet::ethernet::{EthernetPacket, MutableEthernetPacket};
+use pnet::packet::{MutablePacket, Packet};
+use pnet_datalink::MacAddr;
+
+use crate::net::datalink::EAPOL;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Code {
@@ -25,87 +30,79 @@ pub enum Type {
 
 pub const EAPOL_PKT_LEN: usize = 96;
 
-pub struct EAPoL <'a> {
-    pub eap_code: Code,
-    pub eap_type: Type,
-    pub data: EthernetFrame<&'a [u8]>,
+pub struct EAPoL<'a> {
+    pub data: EthernetPacket<'a>,
 }
 
-impl<'a> EAPoL <'a> {
-    pub fn from_bytes(data: &'a [u8]) -> Result<Self, &'static str> {
-        if data.len() < 23 {
-            return Err("Packet too short for EAPoL");
+impl<'a> EAPoL<'a> {
+    pub fn new(data: EthernetPacket<'a>) -> Option<Self> {
+        let pkt = data.packet();
+        let pkt_check_len = u16::from_be_bytes([pkt[20], pkt[21]]);
+        log::debug!("EAPol Length: {}, {}", pkt.len(), pkt_check_len);
+        if data.get_ethertype() != EAPOL {
+            return None;
         }
-        let pkt_len = data.len();
-        let pkt_len2 = u16::from_be_bytes([data[20], data[21]]);
-        log::debug!("EAPol Length: {}, {}", pkt_len, pkt_len2);
-        Ok(Self {
-            eap_code: match data[18] {
-                1 => Code::REQUEST,
-                2 => Code::RESPONSE,
-                3 => Code::SUCCESS,
-                4 => Code::FAILURE,
-                10 => Code::H3CDATA,
-                _ => Code::Unknown,
-            },
-            eap_type: match data[22] {
-                1 => Type::IDENTITY,
-                2 => Type::NOTIFICATION,
-                4 => Type::MD5,
-                20 => Type::AVAILABLE,
-                7 => Type::Allocated0x07,
-                8 => Type::Allocated0x08,
-                _ => Type::Unknown,
-            },
-            data: EthernetFrame::new_unchecked(data),
-        })
+        Some(Self { data })
+    }
+
+    pub fn eap_code(&self) -> Code {
+        match self.data.packet()[18] {
+            1 => Code::REQUEST,
+            2 => Code::RESPONSE,
+            3 => Code::SUCCESS,
+            4 => Code::FAILURE,
+            10 => Code::H3CDATA,
+            _ => Code::Unknown,
+        }
+    }
+
+    pub fn eap_type(&self) -> Type {
+        match self.data.packet()[22] {
+            1 => Type::IDENTITY,
+            2 => Type::NOTIFICATION,
+            4 => Type::MD5,
+            20 => Type::AVAILABLE,
+            7 => Type::Allocated0x07,
+            8 => Type::Allocated0x08,
+            _ => Type::Unknown,
+        }
     }
 
     pub fn eap_id(&self) -> u8 {
-        self.data.as_ref()[19]
-    }
-
-    pub fn eap_type(&self) -> u8 {
-        self.data.as_ref()[22]
+        self.data.packet()[19]
     }
 
     pub fn md5_challenge(&self) -> &[u8] {
-        &self.data.as_ref()[24..40]
+        &self.data.packet()[24..40]
     }
 
-    pub fn src_addr(&self) -> EthernetAddress {
-        self.data.src_addr()
+    pub fn src_addr(&self) -> MacAddr {
+        self.data.get_source()
     }
 
     pub fn parse_error(&self) -> &str {
-        let error = std::str::from_utf8(&self.data.as_ref()[23..]).unwrap();
+        let error = std::str::from_utf8(&self.data.packet()[23..]).unwrap();
         eap_err_parse(error)
     }
 }
 
-pub struct SendEAPoL {
-    pub data: EthernetFrame<[u8; EAPOL_PKT_LEN]>,
+pub struct SendEAPoL<'a> {
+    // pub data: EthernetFrame<[u8; EAPOL_PKT_LEN]>,
+    pub data: MutableEthernetPacket<'a>,
 }
 
-impl SendEAPoL {
+impl<'a> SendEAPoL<'a> {
     fn eap_id(&self) -> u8 {
-        self.data.as_ref()[19]
+        self.data.packet()[19]
     }
 
-    pub fn new() -> Self {
-        let mut data = EthernetFrame::new_unchecked([0u8; EAPOL_PKT_LEN]);
-        data.set_ethertype(smoltcp::wire::EthernetProtocol::Unknown(0x888E));
-        Self {
-            data,
-        }
-    }
-
-    pub fn set_src_addr(&mut self, addr: EthernetAddress) {
-        self.data.set_src_addr(addr);
-    }
-
-    pub fn set_dst_addr(&mut self, addr: EthernetAddress) {
-        self.data.set_dst_addr(addr);
+    pub fn new(data: &'a mut [u8]) -> Self {
+        assert!(data.len() >= EAPOL_PKT_LEN);
+        let mut data = MutableEthernetPacket::new(data).expect("Fail to construct send packet");
+        data.set_ethertype(EAPOL);
+        let mut it = Self { data };
+        it.set_version();
+        it
     }
 
     /// Set the EAP code. (At offset 18)
@@ -123,37 +120,50 @@ impl SendEAPoL {
         self.data.payload_mut()[22 - 14] = eap_type as u8;
     }
 
+    pub fn set_version(&mut self) {
+        self.data.payload_mut()[0] = 0x01; // Version 1
+    }
+
+    pub fn set_length(&mut self, len: u16) {
+        // TODO: big small endian
+        self.data.payload_mut()[16 - 14..].copy_from_slice(&len.to_be_bytes());
+        self.data.payload_mut()[20 - 14..].copy_from_slice(&len.to_be_bytes());
+    }
+
+    pub fn set_zerolength(&mut self) {
+        self.data.payload_mut()[2] = 0;
+        self.data.payload_mut()[3] = 0;
+    }
+
     pub fn set_md5_challenge(&mut self, password: &str, challenge: &[u8]) {
         let mut md5 = md5::Context::new();
-        md5.consume(&[self.eap_id()]);
+        md5.consume([self.eap_id()]);
         md5.consume(password.as_bytes());
         md5.consume(&challenge[..16]);
         let digest = md5.compute();
         self.data.payload_mut()[24 - 14..40 - 14].copy_from_slice(digest.as_ref());
     }
 
-    pub fn start(&mut self) -> &[u8] {
-        self.data.payload_mut().fill(0);
-        self.data.payload_mut()[0] = 0x01;  // Version 1
-        self.data.payload_mut()[1] = 0x01;  // Type Start
-        self.data.payload_mut()[2] = 0x00;  // Length 0x0000
-        self.data.payload_mut()[3] = 0x00;
-        self.data.as_ref()
+    pub fn set_response_type(&mut self, response_type: u8) {
+        self.data.payload_mut()[1] = response_type; // Type Start
     }
 
-    pub fn identity(&mut self, id: u8, ipaddr: Ipv4Addr, username: &str) -> &[u8] {
-        self.data.payload_mut().fill(0);
-        self.data.payload_mut()[0] = 0x01;  // Version 1
-        self.data.payload_mut()[1] = 0x00;  // Type EAP Packet
+    pub fn start(&mut self) {
+        self.set_response_type(0x01);
+        self.set_zerolength();
+    }
+
+    pub fn identity(&mut self, id: u8, ipaddr: Ipv4Addr, username: &str) {
+        self.set_response_type(0x00);
 
         // Extensible Authentication Protocol
-        self.set_eap_code(Code::RESPONSE);  // Code
-        self.set_eap_id(id);  // ID
-        self.set_eap_type(Type::IDENTITY);  // Type
+        self.set_eap_code(Code::RESPONSE); // Code
+        self.set_eap_id(id); // ID
+        self.set_eap_type(Type::IDENTITY); // Type
 
         // Username
         let mut pos = 23 - 14;
-        self.data.payload_mut()[pos ..pos + username.len()].copy_from_slice(username.as_bytes());
+        self.data.payload_mut()[pos..pos + username.len()].copy_from_slice(username.as_bytes());
         pos += username.len();
 
         let fill = [0x0, 0x44, 0x61, 0x0, 0x0];
@@ -165,10 +175,7 @@ impl SendEAPoL {
 
         // Length
         let eap_len: u16 = username.len() as u16 + 14;
-        self.data.payload_mut()[16 - 14..].copy_from_slice(&eap_len.to_be_bytes());
-        self.data.payload_mut()[20 - 14..].copy_from_slice(&eap_len.to_be_bytes());
-
-        self.data.as_ref()
+        self.set_length(eap_len);
     }
 
     pub fn md5_response(
@@ -178,23 +185,21 @@ impl SendEAPoL {
         challenge: &[u8],
         username: &str,
         password: &str,
-    ) -> &[u8] {
-        self.data.payload_mut().fill(0);
-        self.data.payload_mut()[0] = 0x01;  // Version 1
-        self.data.payload_mut()[1] = 0x00;  // Type EAP Packet
+    ) {
+        self.set_response_type(0x00); // Type EAP Packet
 
         // Extensible Authentication Protocol
-        self.set_eap_code(Code::RESPONSE);  // Code
-        self.set_eap_id(id);  // ID
-        self.set_eap_type(Type::MD5);  // Type
-        self.data.payload_mut()[23 - 14] = 0x10;  // Value-Size: 16 Bytes
+        self.set_eap_code(Code::RESPONSE); // Code
+        self.set_eap_id(id); // ID
+        self.set_eap_type(Type::MD5); // Type
+        self.data.payload_mut()[23 - 14] = 0x10; // Value-Size: 16 Bytes
 
         // MD5 Challenge
         self.set_md5_challenge(password, challenge);
 
         // Username
         let mut pos = 40 - 14;
-        self.data.payload_mut()[pos ..pos + username.len()].copy_from_slice(username.as_bytes());
+        self.data.payload_mut()[pos..pos + username.len()].copy_from_slice(username.as_bytes());
         pos += username.len();
 
         let fill = [0x0, 0x44, 0x61, 0x2a, 0x0];
@@ -207,24 +212,18 @@ impl SendEAPoL {
 
         // Length
         let eap_len: u16 = username.len() as u16 + 31;
-        self.data.payload_mut()[16 - 14..].copy_from_slice(&eap_len.to_be_bytes());
-        self.data.payload_mut()[20 - 14..].copy_from_slice(&eap_len.to_be_bytes());
-
-        self.data.as_ref()
+        self.set_length(eap_len);
     }
 
-    pub fn logoff(&mut self) -> &[u8] {
+    pub fn logoff(&mut self) {
         self.data.payload_mut().fill(0xa5);
-        self.data.payload_mut()[0] = 0x01; // Version 1
-        self.data.payload_mut()[1] = 0x02; // Type Logoff
-        self.data.payload_mut()[2] = 0x00; // Length 0x0000
-        self.data.payload_mut()[3] = 0x00;
-
-        self.data.as_ref()
+        self.set_version();
+        self.set_response_type(0x02);
+        self.set_zerolength();
     }
 }
 
-pub fn eap_err_parse<'a>(str: &'a str) -> &'a str {
+pub fn eap_err_parse(str: &str) -> &str {
     if str.starts_with("userid error") {
         let errcode: i32 = str[12..].trim().parse().unwrap_or(-1);
         return match errcode {

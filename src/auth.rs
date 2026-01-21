@@ -13,17 +13,14 @@ use smoltcp::wire::EthernetAddress;
 
 use crate::{
     drcom,
-    eap::{self, EAPoL},
     net::{Dot1xChannel, NetworkError},
     util::*,
 };
 
 const ETH_FRAME_LEN: usize = 1514;
-const LOGOFF_ATTEMPTS: u8 = 2;
-const LOGOFF_TIMEOUT_MS: u64 = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DestMac {
+pub enum DestMac {
     Multicast,
     Broadcast,
     RuijieSwitch,
@@ -98,12 +95,10 @@ impl From<std::io::Error> for EAPError {
 }
 
 pub struct Dot1xAuth {
-    success_8021x: bool,
+    // success_8021x: bool,
     channel: Dot1xChannel,
-    local_mac: EthernetAddress,
-    local_ip: Ipv4Addr,
-    send_pkt: eap::SendEAPoL,
-
+    // local_mac: EthernetAddress,
+    // local_ip: Ipv4Addr,
     username: String,
     password: String,
 }
@@ -116,101 +111,30 @@ impl Dot1xAuth {
     ) -> Result<Self, NetworkError> {
         let channel = Dot1xChannel::new(interface_name, 1000)?;
 
-        let local_mac = EthernetAddress::from_bytes(&channel.mac_address()?);
-        let local_ip = channel.ipv4_address()?;
+        // let local_mac = EthernetAddress::from_bytes(&channel.mac_address()?);
+        // let local_ip = channel.ipv4_address()?;
 
-        let mut send_pkt = eap::SendEAPoL::new();
-        send_pkt.set_src_addr(local_mac);
-        send_pkt.set_dst_addr(DestMac::Multicast.to_addr());
+        // let mut send_pkt = eap::SendEAPoL::new();
+        // send_pkt.set_src_addr(local_mac);
+        // send_pkt.set_dst_addr(DestMac::Multicast.to_addr());
 
         Ok(Self {
-            success_8021x: false,
+            // success_8021x: false,
             channel,
-            local_mac,
-            local_ip,
+            // local_mac,
+            // local_ip,
             username,
             password,
-            send_pkt,
+            // send_pkt,
         })
     }
 
-    /// Send EAPOL Start to get the server MAC address and perform authentication.
-    /// Dr.com client sends EAP packets to 3 possible destination MACs:
-    /// - Multicast (01:80:c2:00:00:03)
-    /// - Broadcast (ff:ff:ff:ff:ff:ff)
-    /// - Ruijie switch (01:d0:f8:00:00:03)
-    ///
-    /// Since we switch between Broadcast and Multicast, we just retry once.
-    fn login_get_server_mac(&mut self) -> Result<(), EAPError> {
-        self.send_pkt.set_dst_addr(DestMac::Multicast.to_addr());
-        self.channel.send(self.send_pkt.start())?;
-        log::info!("DOT1X: Multicast start.");
-
-        match self.wait_eapol() {
-            Err(EAPError::Timeout) => {}
-            other => return other,
-        }
-
-        self.send_pkt.set_dst_addr(DestMac::Broadcast.to_addr());
-        self.channel.send(self.send_pkt.start())?;
-        log::info!("DOT1X: Broadcast start.");
-
-        self.wait_eapol()
-    }
-
-    fn wait_eapol(&mut self) -> Result<(), EAPError> {
-        let packet_data = self.channel.recv_eapol()?;
-        let result = EAPoL::from_bytes(&packet_data).map_err(|e| {
-            log::error!("Failed to parse EAPoL packet: {}", e);
-            EAPError::InvalidPacket
-        })?;
-        self.send_pkt.set_dst_addr(result.src_addr());
-
-        use eap::Code::*;
-        use eap::Type::*;
-        let pkt_ref = match result.eap_code {
-            REQUEST => match result.eap_type {
-                IDENTITY => self
-                    .send_pkt
-                    .identity(result.eap_id(), self.local_ip, &self.username),
-                MD5 => self.send_pkt.md5_response(
-                    result.eap_id(),
-                    self.local_ip,
-                    result.md5_challenge(),
-                    &self.username,
-                    &self.password,
-                ),
-                NOTIFICATION => {
-                    log::warn!("DOT1X: NOTIFICATION: {}", result.parse_error());
-                    return Err(EAPError::Notification);
-                }
-                _ => {
-                    log::error!("Unknown EAPOL type: {:?}", result.eap_type());
-                    return Err(EAPError::InvalidPacket);
-                }
-            },
-            FAILURE => return Err(EAPError::Failure),
-            SUCCESS => {
-                self.success_8021x = true;
-                return Ok(());
-            }
-            _ => return Err(EAPError::InvalidPacket),
-        };
-
-        self.channel.send(pkt_ref)?;
-        Ok(())
-    }
-
-    pub fn is_success(&self) -> bool {
-        self.success_8021x
-    }
-
     pub fn local_ip(&self) -> Ipv4Addr {
-        self.local_ip
+        self.channel.ipv4_address().unwrap()
     }
 
     pub fn local_mac(&self) -> EthernetAddress {
-        self.local_mac
+        EthernetAddress::from_bytes(&self.channel.mac_address().unwrap().octets())
     }
 
     /// Get the interface name for the channel.
@@ -218,88 +142,18 @@ impl Dot1xAuth {
         &self.channel.interface().name
     }
 
+    pub fn logoff(&mut self) {
+        self.channel.send_logoff_eapol();
+    }
+
     /// Set the timeout for EAPOL channel polling.
     pub fn set_timeout(&mut self, timeout_ms: u64) -> Result<(), EAPError> {
-        let name = self.channel.interface().name.clone();
-        self.channel.set_timeout(&name, timeout_ms)?;
-        Ok(())
+        Ok(self.channel.set_timeout(timeout_ms)?)
     }
 
-    /// Send logoff packets to the server.
-    /// Following the C scutclient implementation, sends 2 logoff packets
-    /// to multicast address, waiting 0.5 seconds for FAILURE response each time.
-    pub fn logoff(&mut self) -> Result<(), EAPError> {
-        log::info!("Client: Send Logoff.");
-
-        // Set short timeout for logoff
-        self.set_timeout(LOGOFF_TIMEOUT_MS)?;
-
-        for _ in 0..LOGOFF_ATTEMPTS {
-            // Send logoff to multicast
-            self.send_pkt.set_dst_addr(DestMac::Multicast.to_addr());
-            self.channel.send(self.send_pkt.logoff())?;
-
-            // Wait for FAILURE response (continue even if received)
-            if let Ok(Some(data)) = self.channel.try_recv_eapol() {
-                if let Ok(pkt) = eap::EAPoL::from_bytes(&data) {
-                    if pkt.eap_code == eap::Code::FAILURE {
-                        log::info!("Logged off.");
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Non-blocking receive and handle EAPOL packet.
-    /// Returns Ok(true) if a packet was received and handled,
-    /// Ok(false) if no packet was ready,
-    /// Err for errors that should terminate the loop.
-    pub fn try_recv_and_handle_eapol(&mut self) -> Result<bool, EAPError> {
-        let packet_data = match self.channel.try_recv_eapol()? {
-            Some(data) => data,
-            None => return Ok(false),
-        };
-
-        let result = eap::EAPoL::from_bytes(&packet_data).map_err(|e| {
-            log::error!("Failed to parse EAPoL packet: {}", e);
-            EAPError::InvalidPacket
-        })?;
-        self.send_pkt.set_dst_addr(result.src_addr());
-
-        use eap::Code::*;
-        use eap::Type::*;
-        let pkt_ref = match result.eap_code {
-            REQUEST => match result.eap_type {
-                IDENTITY => self
-                    .send_pkt
-                    .identity(result.eap_id(), self.local_ip, &self.username),
-                MD5 => self.send_pkt.md5_response(
-                    result.eap_id(),
-                    self.local_ip,
-                    result.md5_challenge(),
-                    &self.username,
-                    &self.password,
-                ),
-                NOTIFICATION => {
-                    log::warn!("DOT1X: NOTIFICATION: {}", result.parse_error());
-                    return Err(EAPError::Notification);
-                }
-                _ => {
-                    log::error!("Unknown EAPOL type: {:?}", result.eap_type());
-                    return Err(EAPError::InvalidPacket);
-                }
-            },
-            FAILURE => return Err(EAPError::Failure),
-            SUCCESS => {
-                self.success_8021x = true;
-                return Ok(true);
-            }
-            _ => return Err(EAPError::InvalidPacket),
-        };
-
-        self.channel.send(pkt_ref)?;
-        Ok(true)
+    pub fn try_recv_and_handle_eapol(&mut self) -> Result<(), EAPError> {
+        self.channel
+            .try_recv_and_handle_eapol(&self.username, &self.password)
     }
 }
 
@@ -310,7 +164,7 @@ pub struct UdpAuth {
     addr: Ipv4Addr,
 
     username: String,
-    password: String,
+    // password: String,
     hostname: String,
     mac: EthernetAddress,
     hash: String,
@@ -326,8 +180,7 @@ pub struct UdpAuth {
     pkt_id: u8,
 
     misc1_flux: u32,
-    misc3_flux: u32,
-
+    // misc3_flux: u32,
     need_hb: bool,
     base_hb_time: SystemTime,
     last_hb_done: bool,
@@ -335,8 +188,8 @@ pub struct UdpAuth {
 
 impl UdpAuthBuilder {
     pub fn build(self) -> Result<UdpAuth, std::io::Error> {
-        let socket = std::net::UdpSocket::bind((self.addr.clone().unwrap(), DRCOM_SERVER_PORT))
-            .map_err(|e| {
+        let socket =
+            std::net::UdpSocket::bind((self.addr.unwrap(), DRCOM_SERVER_PORT)).map_err(|e| {
                 log::error!("Failed to bind UDP socket: {}", e);
                 e
             })?;
@@ -349,7 +202,7 @@ impl UdpAuthBuilder {
             socket,
             pkt_id: 0,
             username: self.username.unwrap(),
-            password: self.password.unwrap(),
+            // password: self.password.unwrap(),
             hostname: self.hostname.unwrap(),
             mac: self.mac.unwrap(),
             hash: self.hash.unwrap(),
@@ -358,7 +211,7 @@ impl UdpAuthBuilder {
             recv_buf: [0; ETH_FRAME_LEN],
             send_buf: [0; ETH_FRAME_LEN],
             misc1_flux: 0,
-            misc3_flux: 0,
+            // misc3_flux: 0,
             base_hb_time: SystemTime::now(),
             last_hb_done: false,
             need_hb: true,
@@ -367,12 +220,6 @@ impl UdpAuthBuilder {
 }
 
 impl UdpAuth {
-    /// Get a reference to the underlying UDP socket.
-    /// Used for mio registration.
-    pub fn socket(&self) -> &std::net::UdpSocket {
-        &self.socket
-    }
-
     /// Get a mutable reference to the underlying UDP socket.
     pub fn socket_mut(&mut self) -> &mut std::net::UdpSocket {
         &mut self.socket
@@ -393,7 +240,8 @@ impl UdpAuth {
     }
 
     pub fn misc_start_alive(&mut self) -> Result<usize, std::io::Error> {
-        self.socket.send(&drcom::misc_start_alive_setter_immediate())
+        self.socket
+            .send(&drcom::misc_start_alive_setter_immediate())
     }
 
     pub fn misc_info(&mut self) -> Result<(), std::io::Error> {
@@ -491,124 +339,150 @@ impl UdpAuth {
         Ok(())
     }
 
-    pub fn get_heartbeat_time(&self) -> SystemTime {
-        self.base_hb_time
-    }
+    // pub fn get_heartbeat_time(&self) -> SystemTime {
+    //     self.base_hb_time
+    // }
 
     pub fn reset_heartbeat_time(&mut self) {
         self.base_hb_time = SystemTime::now();
     }
 }
 
-/// Single-threaded authentication event loop using timeout-based polling.
-/// This is cross-platform (works on Windows, Linux, macOS) and replaces
-/// the previous two-thread architecture that had synchronization issues.
-///
-/// The approach is similar to the C scutclient's select() loop, but uses
-/// short timeouts on both sockets to achieve non-blocking behavior.
-pub fn authentication(mut dot1x: Dot1xAuth, mut udp: UdpAuth) -> Result<(), EAPError> {
-    // Phase 1: Initial 802.1X authentication (blocking)
-    dot1x.login_get_server_mac()?;
+pub struct Auth {
+    eap_success: bool,
+    start_loop: DestMac,
+    dot1x: Dot1xAuth,
+    udp: UdpAuth,
+}
 
-    while !dot1x.is_success() {
-        dot1x.wait_eapol()?;
+impl Auth {
+    pub fn new(dot1x: Dot1xAuth, udp: UdpAuth) -> Self {
+        Self {
+            eap_success: false,
+            start_loop: DestMac::Multicast,
+            dot1x,
+            udp,
+        }
     }
-    log::info!("DOT1X: Authentication successful.");
 
-    // Phase 2: Start UDP keepalive
-    udp.misc_start_alive()?;
-    udp.reset_heartbeat_time();
+    /// Single-threaded authentication event loop using timeout-based polling.
+    /// This is cross-platform (works on Windows, Linux, macOS) and replaces
+    /// the previous two-thread architecture that had synchronization issues.
+    ///
+    /// The approach is similar to the C scutclient's select() loop, but uses
+    /// short timeouts on both sockets to achieve non-blocking behavior.
+    pub fn authentication(&mut self) -> Result<(), EAPError> {
+        // Phase 2: Start UDP keepalive
+        self.udp.misc_start_alive()?;
+        self.udp.reset_heartbeat_time();
 
-    // Phase 3: Set up shutdown flag for signal handling
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
+        // Phase 3: Set up shutdown flag for signal handling
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
 
-    ctrlc::set_handler(move || {
-        log::info!("Received shutdown signal...");
-        shutdown_clone.store(true, Ordering::SeqCst);
-    })
-    .expect("Error setting Ctrl-C handler");
+        ctrlc::set_handler(move || {
+            log::info!("Received shutdown signal...");
+            shutdown_clone.store(true, Ordering::SeqCst);
+        })
+        .expect("Error setting Ctrl-C handler");
 
-    // Phase 4: Configure short timeouts for polling mode
-    // This enables cross-platform non-blocking behavior without platform-specific APIs
-    const POLL_TIMEOUT_MS: u64 = 100;
+        // Phase 4: Configure short timeouts for polling mode
+        // This enables cross-platform non-blocking behavior without platform-specific APIs
+        const POLL_TIMEOUT_MS: u64 = 100;
 
-    dot1x.set_timeout(POLL_TIMEOUT_MS)?;
-    udp.socket_mut()
-        .set_read_timeout(Some(Duration::from_millis(POLL_TIMEOUT_MS)))
-        .map_err(|e| {
-            log::error!("Failed to set UDP socket timeout: {}", e);
-            EAPError::Network
-        })?;
+        self.dot1x.set_timeout(POLL_TIMEOUT_MS)?;
+        self.udp
+            .socket_mut()
+            .set_read_timeout(Some(Duration::from_millis(POLL_TIMEOUT_MS)))
+            .map_err(|e| {
+                log::error!("Failed to set UDP socket timeout: {}", e);
+                EAPError::Network
+            })?;
 
-    log::info!("Entering main event loop...");
+        log::info!("Entering main event loop...");
 
-    // Phase 5: Unified polling loop
-    // Both sockets have short timeouts, so we poll them sequentially
-    loop {
-        // Check for shutdown signal at start of each iteration
-        if shutdown.load(Ordering::SeqCst) {
-            log::info!("Shutting down...");
-            dot1x.logoff()?;
-            return Ok(());
-        }
-
-        // Check for EAPOL packets (handles re-authentication requests)
-        match dot1x.try_recv_and_handle_eapol() {
-            Ok(true) => {
-                log::debug!("EAPOL packet processed");
+        // Phase 5: Unified polling loop
+        // Both sockets have short timeouts, so we poll them sequentially
+        loop {
+            // Check for shutdown signal at start of each iteration
+            if shutdown.load(Ordering::SeqCst) {
+                log::info!("Shutting down...");
+                self.dot1x.logoff();
+                return Ok(());
             }
-            Ok(false) => {
-                // No EAPOL packet ready (timeout), continue to UDP
-            }
-            Err(EAPError::Notification) => {
-                // Notification received, log but continue
-                log::warn!("EAPOL notification received, continuing...");
-            }
-            Err(e) => {
-                log::error!("EAPOL error: {:?}", e);
-                return Err(e);
-            }
-        }
 
-        // Check for UDP packets
-        match udp.try_recv() {
-            Ok(Some(len)) => {
-                let buf = udp.recv_buf[..len].to_vec();
-                if let Err(e) = udp.handle(&buf) {
-                    log::error!("UDP handle error: {}", e);
+            // Check for EAPOL packets (handles re-authentication requests)
+            use EAPError::*;
+            match self.dot1x.try_recv_and_handle_eapol() {
+                Ok(()) => {
+                    if !self.eap_success {
+                        log::info!("DOT1X: Authentication successful.");
+                    }
+                    self.eap_success = true;
+                }
+                Err(Notification) => {
+                    // Notification received, log but continue
+                    log::warn!("EAPOL notification received, continuing...");
+                }
+                Err(Timeout) => {
+                    log::debug!("Timeout...");
+                    if !self.eap_success {
+                        match self.start_loop {
+                            DestMac::Multicast => self.start_loop = DestMac::Broadcast,
+                            DestMac::Broadcast => self.start_loop = DestMac::RuijieSwitch, // just alias of "if still timeout, just fail"
+                            DestMac::RuijieSwitch => return Err(EAPError::Network), // Init failed, error type need refactor
+                        }
+                        continue; // skip udp heart beat
+                    }
+                }
+                Err(e) => {
+                    log::error!("EAPOL error: {:?}", e);
+                    return Err(e);
+                }
+            }
+
+            // Check for UDP packets
+            match self.udp.try_recv() {
+                Ok(Some(len)) => {
+                    let buf = self.udp.recv_buf[..len].to_vec();
+                    if let Err(e) = self.udp.handle(&buf) {
+                        log::error!("UDP handle error: {}", e);
+                        return Err(EAPError::Network);
+                    }
+                }
+                Ok(None) => {
+                    // No UDP packet ready (timeout), continue
+                }
+                Err(e) => {
+                    log::error!("UDP recv error: {}", e);
                     return Err(EAPError::Network);
                 }
             }
-            Ok(None) => {
-                // No UDP packet ready (timeout), continue
-            }
-            Err(e) => {
-                log::error!("UDP recv error: {}", e);
-                return Err(EAPError::Network);
-            }
-        }
 
-        // Heartbeat logic - runs every loop iteration
-        if udp.need_hb {
-            let elapsed = udp
-                .base_hb_time
-                .elapsed()
-                .unwrap_or(Duration::from_secs(0));
+            // Heartbeat logic - runs every loop iteration
+            if self.udp.need_hb {
+                let elapsed = self
+                    .udp
+                    .base_hb_time
+                    .elapsed()
+                    .unwrap_or(Duration::from_secs(0));
 
-            if !udp.last_hb_done && elapsed > Duration::from_secs(DRCOM_UDP_HEARTBEAT_TIMEOUT) {
-                log::error!("Heartbeat timeout");
-                return Err(EAPError::Timeout);
-            }
-
-            if elapsed > Duration::from_secs(DRCOM_UDP_HEARTBEAT_DELAY) {
-                if let Err(e) = udp.alive_heartbeat() {
-                    log::error!("Failed to send heartbeat: {}", e);
-                    return Err(EAPError::Network);
+                if !self.udp.last_hb_done
+                    && elapsed > Duration::from_secs(DRCOM_UDP_HEARTBEAT_TIMEOUT)
+                {
+                    log::error!("Heartbeat timeout");
+                    return Err(EAPError::Timeout);
                 }
-                udp.reset_heartbeat_time();
-                udp.last_hb_done = false;
-                log::debug!("Alive heartbeat sent");
+
+                if elapsed > Duration::from_secs(DRCOM_UDP_HEARTBEAT_DELAY) {
+                    if let Err(e) = self.udp.alive_heartbeat() {
+                        log::error!("Failed to send heartbeat: {}", e);
+                        return Err(EAPError::Network);
+                    }
+                    self.udp.reset_heartbeat_time();
+                    self.udp.last_hb_done = false;
+                    log::debug!("Alive heartbeat sent");
+                }
             }
         }
     }

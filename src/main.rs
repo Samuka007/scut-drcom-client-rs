@@ -10,6 +10,8 @@ mod util;
 
 use auth::{Dot1xAuth, UdpAuthBuilder};
 
+use crate::auth::Auth;
+
 #[derive(Parser)]
 #[command(name = "scut-drcom-client")]
 #[command(about = "SCUT DrCom authentication client")]
@@ -73,13 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle logoff-only mode
     if args.logoff {
-        dot1x.logoff().map_err(|e| {
-            log::error!("Logoff failed: {:?}", e);
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("{:?}", e),
-            )) as Box<dyn std::error::Error>
-        })?;
+        dot1x.logoff();
         log::info!("Logoff complete.");
         return Ok(());
     }
@@ -88,12 +84,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .addr(dot1x.local_ip())
         .mac(dot1x.local_mac())
         .username(args.username)
-        .password(args.password)
+        // .password(args.password)
         .hostname(args.hostname)
         .hash(args.hash)
         .build()?;
 
-    auth::authentication(dot1x, udp).map_err(|e| {
+    let mut auth = Auth::new(dot1x, udp);
+
+    auth.authentication().map_err(|e| {
         log::error!("Authentication failed: {:?}", e);
         Box::new(std::io::Error::new(
             std::io::ErrorKind::Other,
