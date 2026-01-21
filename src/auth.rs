@@ -1,11 +1,26 @@
-use std::{net::{IpAddr, Ipv4Addr, SocketAddrV4}, time::SystemTime};
+use std::{
+    io::ErrorKind,
+    net::Ipv4Addr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, SystemTime},
+};
 
 use derive_builder::Builder;
-use smoltcp::wire::{EthernetAddress, EthernetFrame};
+use smoltcp::wire::EthernetAddress;
 
-use crate::{drcom, eap::{self, EAPoL}, util::*};
+use crate::{
+    drcom,
+    eap::{self, EAPoL},
+    net::{Dot1xChannel, NetworkError},
+    util::*,
+};
 
 const ETH_FRAME_LEN: usize = 1514;
+const LOGOFF_ATTEMPTS: u8 = 2;
+const LOGOFF_TIMEOUT_MS: u64 = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DestMac {
@@ -58,16 +73,16 @@ pub enum EAPError {
     InvalidPacket,
     Notification,
     Failure,
+    Network,
     Unknown,
 }
 
-impl From<pcap::Error> for EAPError {
-    fn from(e: pcap::Error) -> Self {
-        use pcap::Error::*;
-        log::debug!("PCAP Error: {:?}", e);
+impl From<NetworkError> for EAPError {
+    fn from(e: NetworkError) -> Self {
+        log::debug!("Network Error: {:?}", e);
         match e {
-            TimeoutExpired => EAPError::Timeout,
-            _ => EAPError::Unknown,
+            NetworkError::Timeout => EAPError::Timeout,
+            _ => EAPError::Network,
         }
     }
 }
@@ -84,11 +99,8 @@ impl From<std::io::Error> for EAPError {
 
 pub struct Dot1xAuth {
     success_8021x: bool,
-    // base_hb_time: libc::time_t,
-    last_hb_done: bool,
-    dev_dotx: pcap::Capture<pcap::Active>,
-    // dev_udp: pcap::Capture<pcap::Active>,
-    // dst_mac: DestMac,
+    channel: Dot1xChannel,
+    local_mac: EthernetAddress,
     local_ip: Ipv4Addr,
     send_pkt: eap::SendEAPoL,
 
@@ -97,38 +109,24 @@ pub struct Dot1xAuth {
 }
 
 impl Dot1xAuth {
-    fn new(
-        dev: &pcap::Device,
+    pub fn new(
+        interface_name: &str,
         username: String,
         password: String,
-    ) -> Result<Self, pcap::Error> {
-        let mut cap_dotx = pcap::Capture::from_device(dev.clone())?
-            .promisc(false)
-            .snaplen(1514)
-            .timeout(1000)
-            .open()?;
-        // capture 802.1x packets
-        cap_dotx.set_datalink(pcap::Linktype::ETHERNET)?;
-        cap_dotx.filter("ether proto 0x888E", true)?;
+    ) -> Result<Self, NetworkError> {
+        let channel = Dot1xChannel::new(interface_name, 1000)?;
 
+        let local_mac = EthernetAddress::from_bytes(&channel.mac_address()?);
+        let local_ip = channel.ipv4_address()?;
 
-        let local_ip = dev.addresses.iter()
-            .find_map(|addr| {
-                if let IpAddr::V4(ipv4) = addr.addr {
-                    Some(ipv4)
-                } else {
-                    None
-                }
-            }).expect("No IPv4 address found");
-        
         let mut send_pkt = eap::SendEAPoL::new();
-        send_pkt.set_src_addr(EthernetAddress::from_bytes(&[0x01; 6]));
+        send_pkt.set_src_addr(local_mac);
         send_pkt.set_dst_addr(DestMac::Multicast.to_addr());
 
         Ok(Self {
             success_8021x: false,
-            last_hb_done: false,
-            dev_dotx: cap_dotx,
+            channel,
+            local_mac,
             local_ip,
             username,
             password,
@@ -136,71 +134,172 @@ impl Dot1xAuth {
         })
     }
 
-    /*
-    * 发送 EAPOL Start 以获取服务器MAC地址及执行后续认证流程
-    * Dr.com客户端发送EAP包目标MAC有3个：
-    * 组播地址 (01:80:c2:00:00:03)
-    * 广播地址 (ff:ff:ff:ff:ff:ff)
-    * 锐捷交换机 (01:d0:f8:00:00:03) PS:我校应该没有这货
-    * 
-    * 因为实际上是在 Broadcast 和 Multicast 之间切换，直接重试1次
-    */
+    /// Send EAPOL Start to get the server MAC address and perform authentication.
+    /// Dr.com client sends EAP packets to 3 possible destination MACs:
+    /// - Multicast (01:80:c2:00:00:03)
+    /// - Broadcast (ff:ff:ff:ff:ff:ff)
+    /// - Ruijie switch (01:d0:f8:00:00:03)
+    ///
+    /// Since we switch between Broadcast and Multicast, we just retry once.
     fn login_get_server_mac(&mut self) -> Result<(), EAPError> {
         self.send_pkt.set_dst_addr(DestMac::Multicast.to_addr());
-        self.dev_dotx.sendpacket(self.send_pkt.start())?;
+        self.channel.send(self.send_pkt.start())?;
         log::info!("DOT1X: Multicast start.");
 
         match self.wait_eapol() {
-            Err(EAPError::Timeout) => {},
+            Err(EAPError::Timeout) => {}
             other => return other,
         }
 
         self.send_pkt.set_dst_addr(DestMac::Broadcast.to_addr());
-        self.dev_dotx.sendpacket(self.send_pkt.start())?;
+        self.channel.send(self.send_pkt.start())?;
         log::info!("DOT1X: Broadcast start.");
 
-        return self.wait_eapol();
+        self.wait_eapol()
     }
 
     fn wait_eapol(&mut self) -> Result<(), EAPError> {
-        let result = self.dev_dotx.next_packet().map(|packet| EAPoL::from_packet(packet))?;
+        let packet_data = self.channel.recv_eapol()?;
+        let result = EAPoL::from_bytes(&packet_data).map_err(|e| {
+            log::error!("Failed to parse EAPoL packet: {}", e);
+            EAPError::InvalidPacket
+        })?;
         self.send_pkt.set_dst_addr(result.src_addr());
 
-        use eap::Type::*;
         use eap::Code::*;
+        use eap::Type::*;
         let pkt_ref = match result.eap_code {
-            REQUEST => {
-                match result.eap_type {
-                    IDENTITY => {
-                        self.send_pkt.identity(result.eap_id(), self.local_ip, &self.username)
-                    }
-                    MD5 => {
-                        self.send_pkt.md5_response(result.eap_id(), self.local_ip, &result.md5_challenge(), &self.username, &self.password)
-                    }
-                    NOTIFICATION => {
-                        log::warn!("DOT1X: NOTIFICATION: {}", result.parse_error());
-                        return Err(EAPError::Notification);
-                    }
-                    _ => {
-                        log::error!("Unknown EAPOL type: {:?}", result.eap_type());
-                        return Err(EAPError::InvalidPacket);
-                    }
+            REQUEST => match result.eap_type {
+                IDENTITY => self
+                    .send_pkt
+                    .identity(result.eap_id(), self.local_ip, &self.username),
+                MD5 => self.send_pkt.md5_response(
+                    result.eap_id(),
+                    self.local_ip,
+                    result.md5_challenge(),
+                    &self.username,
+                    &self.password,
+                ),
+                NOTIFICATION => {
+                    log::warn!("DOT1X: NOTIFICATION: {}", result.parse_error());
+                    return Err(EAPError::Notification);
+                }
+                _ => {
+                    log::error!("Unknown EAPOL type: {:?}", result.eap_type());
+                    return Err(EAPError::InvalidPacket);
                 }
             },
-            FAILURE => return Err(EAPError::Failure), // TODO change udp state
+            FAILURE => return Err(EAPError::Failure),
             SUCCESS => {
                 self.success_8021x = true;
-                return Ok(())
-            },
+                return Ok(());
+            }
             _ => return Err(EAPError::InvalidPacket),
         };
 
-        self.dev_dotx.sendpacket(pkt_ref)?;
+        self.channel.send(pkt_ref)?;
         Ok(())
     }
 
     pub fn is_success(&self) -> bool {
         self.success_8021x
+    }
+
+    pub fn local_ip(&self) -> Ipv4Addr {
+        self.local_ip
+    }
+
+    pub fn local_mac(&self) -> EthernetAddress {
+        self.local_mac
+    }
+
+    /// Get the interface name for the channel.
+    pub fn interface_name(&self) -> &str {
+        &self.channel.interface().name
+    }
+
+    /// Set the timeout for EAPOL channel polling.
+    pub fn set_timeout(&mut self, timeout_ms: u64) -> Result<(), EAPError> {
+        let name = self.channel.interface().name.clone();
+        self.channel.set_timeout(&name, timeout_ms)?;
+        Ok(())
+    }
+
+    /// Send logoff packets to the server.
+    /// Following the C scutclient implementation, sends 2 logoff packets
+    /// to multicast address, waiting 0.5 seconds for FAILURE response each time.
+    pub fn logoff(&mut self) -> Result<(), EAPError> {
+        log::info!("Client: Send Logoff.");
+
+        // Set short timeout for logoff
+        self.set_timeout(LOGOFF_TIMEOUT_MS)?;
+
+        for _ in 0..LOGOFF_ATTEMPTS {
+            // Send logoff to multicast
+            self.send_pkt.set_dst_addr(DestMac::Multicast.to_addr());
+            self.channel.send(self.send_pkt.logoff())?;
+
+            // Wait for FAILURE response (continue even if received)
+            if let Ok(Some(data)) = self.channel.try_recv_eapol() {
+                if let Ok(pkt) = eap::EAPoL::from_bytes(&data) {
+                    if pkt.eap_code == eap::Code::FAILURE {
+                        log::info!("Logged off.");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Non-blocking receive and handle EAPOL packet.
+    /// Returns Ok(true) if a packet was received and handled,
+    /// Ok(false) if no packet was ready,
+    /// Err for errors that should terminate the loop.
+    pub fn try_recv_and_handle_eapol(&mut self) -> Result<bool, EAPError> {
+        let packet_data = match self.channel.try_recv_eapol()? {
+            Some(data) => data,
+            None => return Ok(false),
+        };
+
+        let result = eap::EAPoL::from_bytes(&packet_data).map_err(|e| {
+            log::error!("Failed to parse EAPoL packet: {}", e);
+            EAPError::InvalidPacket
+        })?;
+        self.send_pkt.set_dst_addr(result.src_addr());
+
+        use eap::Code::*;
+        use eap::Type::*;
+        let pkt_ref = match result.eap_code {
+            REQUEST => match result.eap_type {
+                IDENTITY => self
+                    .send_pkt
+                    .identity(result.eap_id(), self.local_ip, &self.username),
+                MD5 => self.send_pkt.md5_response(
+                    result.eap_id(),
+                    self.local_ip,
+                    result.md5_challenge(),
+                    &self.username,
+                    &self.password,
+                ),
+                NOTIFICATION => {
+                    log::warn!("DOT1X: NOTIFICATION: {}", result.parse_error());
+                    return Err(EAPError::Notification);
+                }
+                _ => {
+                    log::error!("Unknown EAPOL type: {:?}", result.eap_type());
+                    return Err(EAPError::InvalidPacket);
+                }
+            },
+            FAILURE => return Err(EAPError::Failure),
+            SUCCESS => {
+                self.success_8021x = true;
+                return Ok(true);
+            }
+            _ => return Err(EAPError::InvalidPacket),
+        };
+
+        self.channel.send(pkt_ref)?;
+        Ok(true)
     }
 }
 
@@ -209,19 +308,19 @@ impl Dot1xAuth {
 #[builder(build_fn(skip))]
 pub struct UdpAuth {
     addr: Ipv4Addr,
-    
+
     username: String,
     password: String,
     hostname: String,
     mac: EthernetAddress,
     hash: String,
-    
+
     crc_md5_info: [u8; 16],
     tail_info: [u8; 16],
-    
+
     recv_buf: [u8; ETH_FRAME_LEN],
     send_buf: [u8; ETH_FRAME_LEN],
-    
+
     socket: std::net::UdpSocket,
     #[builder(default = 0)]
     pkt_id: u8,
@@ -233,7 +332,6 @@ pub struct UdpAuth {
     base_hb_time: SystemTime,
     last_hb_done: bool,
 }
-
 
 impl UdpAuthBuilder {
     pub fn build(self) -> Result<UdpAuth, std::io::Error> {
@@ -269,6 +367,30 @@ impl UdpAuthBuilder {
 }
 
 impl UdpAuth {
+    /// Get a reference to the underlying UDP socket.
+    /// Used for mio registration.
+    pub fn socket(&self) -> &std::net::UdpSocket {
+        &self.socket
+    }
+
+    /// Get a mutable reference to the underlying UDP socket.
+    pub fn socket_mut(&mut self) -> &mut std::net::UdpSocket {
+        &mut self.socket
+    }
+
+    /// Non-blocking receive for UDP packets.
+    /// Returns Ok(Some(len)) if a packet is received,
+    /// Ok(None) if no packet is ready (would-block),
+    /// Err for actual errors.
+    pub fn try_recv(&mut self) -> Result<Option<usize>, std::io::Error> {
+        match self.socket.recv(&mut self.recv_buf) {
+            Ok(len) => Ok(Some(len)),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
 
     pub fn misc_start_alive(&mut self) -> Result<usize, std::io::Error> {
         self.socket.send(&drcom::misc_start_alive_setter_immediate())
@@ -276,7 +398,7 @@ impl UdpAuth {
 
     pub fn misc_info(&mut self) -> Result<(), std::io::Error> {
         let len = drcom::misc_info_setter(
-            &mut self.send_buf, 
+            &mut self.send_buf,
             &self.recv_buf,
             &mut self.crc_md5_info,
             &self.username,
@@ -321,7 +443,6 @@ impl UdpAuth {
                 drcom::AuthType::ResponseForAlive => {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     self.misc_info()?;
-                    //ALIVE已经回复，关闭心跳计时
                     self.reset_heartbeat_time();
                     self.last_hb_done = true;
                     self.need_hb = false;
@@ -334,27 +455,25 @@ impl UdpAuth {
                     self.need_hb = true;
                     log::info!("Server: MISC_RESPONSE_INFO. Send MISC_HEART_BEAT_01.");
                 }
-                drcom::AuthType::HeartBeat => {
-                    match drcom::MiscType::from(packet[5]) {
-                        drcom::MiscType::FileType => {
-                            self.misc_heartbeat1()?;
-                            log::info!("Server: MISC_FILE_TYPE. Send MISC_HEART_BEAT_01.");
-                        },
-                        drcom::MiscType::HeartBeat02Type => {
-                            self.misc_heartbeat3()?;
-                            log::info!("Server: MISC_HEART_BEAT_02. Send MISC_HEART_BEAT_03.");
-                        },
-                        drcom::MiscType::HeartBeat04Type => {
-                            self.reset_heartbeat_time();
-                            self.last_hb_done = true;
-                            self.alive_heartbeat()?;
-                            log::info!("Server: MISC_HEART_BEAT_04. Wait for next heartbeat cycle.");
-                        },
-                        _ => {
-                            log::error!("Server: Unknown MISC type: {:02x}", packet[5]);
-                        }
+                drcom::AuthType::HeartBeat => match drcom::MiscType::from(packet[5]) {
+                    drcom::MiscType::FileType => {
+                        self.misc_heartbeat1()?;
+                        log::info!("Server: MISC_FILE_TYPE. Send MISC_HEART_BEAT_01.");
                     }
-                }
+                    drcom::MiscType::HeartBeat02Type => {
+                        self.misc_heartbeat3()?;
+                        log::info!("Server: MISC_HEART_BEAT_02. Send MISC_HEART_BEAT_03.");
+                    }
+                    drcom::MiscType::HeartBeat04Type => {
+                        self.reset_heartbeat_time();
+                        self.last_hb_done = true;
+                        self.alive_heartbeat()?;
+                        log::info!("Server: MISC_HEART_BEAT_04. Wait for next heartbeat cycle.");
+                    }
+                    _ => {
+                        log::error!("Server: Unknown MISC type: {:02x}", packet[5]);
+                    }
+                },
                 drcom::AuthType::ResponseHeartBeat => {
                     self.misc_heartbeat1()?;
                     log::info!("Server: MISC_RESPONSE_HEART_BEAT. Send MISC_HEART_BEAT_01.");
@@ -364,9 +483,9 @@ impl UdpAuth {
                 }
             }
         }
-        
+
         if packet[0] == 0x4d && packet[1] == 0x38 {
-            log::info!("Server info: {}", unsafe { std::str::from_utf8_unchecked(&packet[4..]) });
+            log::info!("Server info: {}", String::from_utf8_lossy(&packet[4..]));
         }
 
         Ok(())
@@ -381,25 +500,116 @@ impl UdpAuth {
     }
 }
 
-pub fn authentication(mut auth: Dot1xAuth, mut udp: UdpAuth) -> Result<(), EAPError> {
-    auth.login_get_server_mac()?;
+/// Single-threaded authentication event loop using timeout-based polling.
+/// This is cross-platform (works on Windows, Linux, macOS) and replaces
+/// the previous two-thread architecture that had synchronization issues.
+///
+/// The approach is similar to the C scutclient's select() loop, but uses
+/// short timeouts on both sockets to achieve non-blocking behavior.
+pub fn authentication(mut dot1x: Dot1xAuth, mut udp: UdpAuth) -> Result<(), EAPError> {
+    // Phase 1: Initial 802.1X authentication (blocking)
+    dot1x.login_get_server_mac()?;
+
+    while !dot1x.is_success() {
+        dot1x.wait_eapol()?;
+    }
+    log::info!("DOT1X: Authentication successful.");
+
+    // Phase 2: Start UDP keepalive
     udp.misc_start_alive()?;
     udp.reset_heartbeat_time();
-    let eapol_thread = std::thread::spawn(move || {
-        loop {
-            match auth.wait_eapol() {
-                Ok(_) | Err(EAPError::Timeout)=> continue,
-                other => return other,
+
+    // Phase 3: Set up shutdown flag for signal handling
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+
+    ctrlc::set_handler(move || {
+        log::info!("Received shutdown signal...");
+        shutdown_clone.store(true, Ordering::SeqCst);
+    })
+    .expect("Error setting Ctrl-C handler");
+
+    // Phase 4: Configure short timeouts for polling mode
+    // This enables cross-platform non-blocking behavior without platform-specific APIs
+    const POLL_TIMEOUT_MS: u64 = 100;
+
+    dot1x.set_timeout(POLL_TIMEOUT_MS)?;
+    udp.socket_mut()
+        .set_read_timeout(Some(Duration::from_millis(POLL_TIMEOUT_MS)))
+        .map_err(|e| {
+            log::error!("Failed to set UDP socket timeout: {}", e);
+            EAPError::Network
+        })?;
+
+    log::info!("Entering main event loop...");
+
+    // Phase 5: Unified polling loop
+    // Both sockets have short timeouts, so we poll them sequentially
+    loop {
+        // Check for shutdown signal at start of each iteration
+        if shutdown.load(Ordering::SeqCst) {
+            log::info!("Shutting down...");
+            dot1x.logoff()?;
+            return Ok(());
+        }
+
+        // Check for EAPOL packets (handles re-authentication requests)
+        match dot1x.try_recv_and_handle_eapol() {
+            Ok(true) => {
+                log::debug!("EAPOL packet processed");
+            }
+            Ok(false) => {
+                // No EAPOL packet ready (timeout), continue to UDP
+            }
+            Err(EAPError::Notification) => {
+                // Notification received, log but continue
+                log::warn!("EAPOL notification received, continuing...");
+            }
+            Err(e) => {
+                log::error!("EAPOL error: {:?}", e);
+                return Err(e);
             }
         }
-    });
 
-    loop {
-        
-        todo!("UDP Loop");
+        // Check for UDP packets
+        match udp.try_recv() {
+            Ok(Some(len)) => {
+                let buf = udp.recv_buf[..len].to_vec();
+                if let Err(e) = udp.handle(&buf) {
+                    log::error!("UDP handle error: {}", e);
+                    return Err(EAPError::Network);
+                }
+            }
+            Ok(None) => {
+                // No UDP packet ready (timeout), continue
+            }
+            Err(e) => {
+                log::error!("UDP recv error: {}", e);
+                return Err(EAPError::Network);
+            }
+        }
+
+        // Heartbeat logic - runs every loop iteration
+        if udp.need_hb {
+            let elapsed = udp
+                .base_hb_time
+                .elapsed()
+                .unwrap_or(Duration::from_secs(0));
+
+            if !udp.last_hb_done && elapsed > Duration::from_secs(DRCOM_UDP_HEARTBEAT_TIMEOUT) {
+                log::error!("Heartbeat timeout");
+                return Err(EAPError::Timeout);
+            }
+
+            if elapsed > Duration::from_secs(DRCOM_UDP_HEARTBEAT_DELAY) {
+                if let Err(e) = udp.alive_heartbeat() {
+                    log::error!("Failed to send heartbeat: {}", e);
+                    return Err(EAPError::Network);
+                }
+                udp.reset_heartbeat_time();
+                udp.last_hb_done = false;
+                log::debug!("Alive heartbeat sent");
+            }
+        }
     }
-
-    eapol_thread.join().unwrap()?;
-    Ok(())
 }
-

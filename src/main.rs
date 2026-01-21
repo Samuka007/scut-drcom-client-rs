@@ -1,32 +1,105 @@
+use std::net::Ipv4Addr;
 
+use clap::Parser;
 
-mod util;
-mod drcom;
 mod auth;
+mod drcom;
 mod eap;
+mod net;
+mod util;
 
-fn print_help(argn: &str) {
-    println!("Usage: {} --username <username> --password <password> [options...]
- -i, --iface <ifname> Interface to perform authentication.
- -n, --dns <dns> DNS server address to be sent to UDP server.
- -H, --hostname <hostname>
- -s, --udp-server <server>
- -c, --cli-version <client version>
- -T, --net-time <time> The time you are allowed to access internet. e.g. 6:10
- -h, --hash <hash> DrAuthSvr.dll hash value.
- -E, --online-hook <command> Command to be execute after EAP authentication success.
- -Q, --offline-hook <command> Command to be execute when you are forced offline at night.
- -D, --debug
- -o, --logoff", argn);
+use auth::{Dot1xAuth, UdpAuthBuilder};
+
+#[derive(Parser)]
+#[command(name = "scut-drcom-client")]
+#[command(about = "SCUT DrCom authentication client")]
+struct Args {
+    #[arg(short, long)]
+    username: String,
+
+    #[arg(short, long)]
+    password: String,
+
+    #[arg(short, long)]
+    iface: String,
+
+    #[arg(short = 'n', long, default_value = "222.201.130.30")]
+    dns: Ipv4Addr,
+
+    #[arg(short = 'H', long, default_value = "DRCOM")]
+    hostname: String,
+
+    #[arg(short = 'h', long, default_value = "")]
+    hash: String,
+
+    #[arg(short = 'D', long)]
+    debug: bool,
+
+    /// Send logoff packets and exit (without full authentication)
+    #[arg(short = 'o', long)]
+    logoff: bool,
 }
 
 fn print_init() {
-    log::info!("scutclient built at: {:?} {:?}", option_env!("DATE"), option_env!("TIME"));
+    log::info!(
+        "scutclient built at: {:?} {:?}",
+        option_env!("DATE"),
+        option_env!("TIME")
+    );
     log::info!("Authored by Scutclient Project");
     log::info!("Source code available at https://github.com/scutclient/scutclient");
     log::info!("Contact us with QQ group 262939451");
     log::info!("#######################################");
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    if args.debug {
+        std::env::set_var("RUST_LOG", "debug");
+    } else {
+        std::env::set_var("RUST_LOG", "info");
+    }
+    env_logger::init();
+
+    print_init();
+
+    log::info!("Using interface: {}", args.iface);
+
+    let mut dot1x = Dot1xAuth::new(&args.iface, args.username.clone(), args.password.clone())?;
+
+    log::info!("Local MAC: {}", dot1x.local_mac());
+    log::info!("Local IP: {}", dot1x.local_ip());
+
+    // Handle logoff-only mode
+    if args.logoff {
+        dot1x.logoff().map_err(|e| {
+            log::error!("Logoff failed: {:?}", e);
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("{:?}", e),
+            )) as Box<dyn std::error::Error>
+        })?;
+        log::info!("Logoff complete.");
+        return Ok(());
+    }
+
+    let udp = UdpAuthBuilder::default()
+        .addr(dot1x.local_ip())
+        .mac(dot1x.local_mac())
+        .username(args.username)
+        .password(args.password)
+        .hostname(args.hostname)
+        .hash(args.hash)
+        .build()?;
+
+    auth::authentication(dot1x, udp).map_err(|e| {
+        log::error!("Authentication failed: {:?}", e);
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("{:?}", e),
+        )) as Box<dyn std::error::Error>
+    })?;
+
+    Ok(())
 }

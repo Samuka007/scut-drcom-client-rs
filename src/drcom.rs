@@ -1,8 +1,4 @@
-use log::{info, warn, error, debug};
 use std::net::Ipv4Addr;
-use md5::Digest;
-
-use crate::{auth, eap};
 
 #[derive(Debug, Clone, Copy)]
 pub enum AuthType {

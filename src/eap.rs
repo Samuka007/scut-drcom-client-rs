@@ -1,6 +1,5 @@
 use std::net::Ipv4Addr;
 
-use pcap::Packet;
 use smoltcp::wire::{EthernetAddress, EthernetFrame};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -19,8 +18,8 @@ pub enum Type {
     NOTIFICATION = 2,
     MD5 = 4,
     AVAILABLE = 20,
-    ALLOCATED_0x07 = 7,
-    ALLOCATED_0x08 = 8,
+    Allocated0x07 = 7,
+    Allocated0x08 = 8,
     Unknown,
 }
 
@@ -33,35 +32,15 @@ pub struct EAPoL <'a> {
 }
 
 impl<'a> EAPoL <'a> {
-    // pub fn from_payload(payload: &'a [u8]) -> Self {
-    //     Self {
-    //         eap_code: match payload[18] {
-    //             1 => Code::REQUEST,
-    //             2 => Code::RESPONSE,
-    //             3 => Code::SUCCESS,
-    //             4 => Code::FAILURE,
-    //             10 => Code::H3CDATA,
-    //             _ => Code::Unknown,
-    //         },
-    //         eap_type: match payload[22] {
-    //             1 => Type::IDENTITY,
-    //             2 => Type::NOTIFICATION,
-    //             4 => Type::MD5,
-    //             20 => Type::AVAILABLE,
-    //             7 => Type::ALLOCATED_0x07,
-    //             8 => Type::ALLOCATED_0x08,
-    //             _ => Type::Unknown,
-    //         },
-    //         data: EthernetFrame::new_unchecked(payload),
-    //     }
-    // }
-
-    pub fn from_packet(packet: Packet<'a>) -> Self {
-        let pkt_len = packet.header.len;
-        let pkt_len2 = u16::from_be_bytes([packet.data[20], packet.data[21]]);
+    pub fn from_bytes(data: &'a [u8]) -> Result<Self, &'static str> {
+        if data.len() < 23 {
+            return Err("Packet too short for EAPoL");
+        }
+        let pkt_len = data.len();
+        let pkt_len2 = u16::from_be_bytes([data[20], data[21]]);
         log::debug!("EAPol Length: {}, {}", pkt_len, pkt_len2);
-        Self {
-            eap_code: match packet.data[18] {
+        Ok(Self {
+            eap_code: match data[18] {
                 1 => Code::REQUEST,
                 2 => Code::RESPONSE,
                 3 => Code::SUCCESS,
@@ -69,21 +48,17 @@ impl<'a> EAPoL <'a> {
                 10 => Code::H3CDATA,
                 _ => Code::Unknown,
             },
-            eap_type: match packet.data[22] {
+            eap_type: match data[22] {
                 1 => Type::IDENTITY,
                 2 => Type::NOTIFICATION,
                 4 => Type::MD5,
                 20 => Type::AVAILABLE,
-                7 => Type::ALLOCATED_0x07,
-                8 => Type::ALLOCATED_0x08,
+                7 => Type::Allocated0x07,
+                8 => Type::Allocated0x08,
                 _ => Type::Unknown,
             },
-            data: EthernetFrame::new_unchecked(packet.data),
-        }
-    }
-
-    pub fn eap_code(&self) -> u8 {
-        self.data.as_ref()[18]
+            data: EthernetFrame::new_unchecked(data),
+        })
     }
 
     pub fn eap_id(&self) -> u8 {
@@ -94,10 +69,6 @@ impl<'a> EAPoL <'a> {
         self.data.as_ref()[22]
     }
 
-    pub fn packet_len(&self) -> u16 {
-        u16::from_be_bytes([self.data.as_ref()[20], self.data.as_ref()[21]])
-    }
-
     pub fn md5_challenge(&self) -> &[u8] {
         &self.data.as_ref()[24..40]
     }
@@ -106,10 +77,6 @@ impl<'a> EAPoL <'a> {
         self.data.src_addr()
     }
 
-    pub fn dst_addr(&self) -> EthernetAddress {
-        self.data.dst_addr()
-    }
-    
     pub fn parse_error(&self) -> &str {
         let error = std::str::from_utf8(&self.data.as_ref()[23..]).unwrap();
         eap_err_parse(error)
@@ -121,32 +88,8 @@ pub struct SendEAPoL {
 }
 
 impl SendEAPoL {
-    pub fn eap_code(&self) -> u8 {
-        self.data.as_ref()[18]
-    }
-
-    pub fn eap_id(&self) -> u8 {
+    fn eap_id(&self) -> u8 {
         self.data.as_ref()[19]
-    }
-
-    pub fn eap_type(&self) -> u8 {
-        self.data.as_ref()[22]
-    }
-
-    pub fn packet_len(&self) -> u16 {
-        u16::from_be_bytes([self.data.as_ref()[20], self.data.as_ref()[21]])
-    }
-
-    pub fn md5_challenge(&self) -> &[u8] {
-        &self.data.as_ref()[24..40]
-    }
-
-    pub fn src_addr(&self) -> EthernetAddress {
-        self.data.src_addr()
-    }
-
-    pub fn dst_addr(&self) -> EthernetAddress {
-        self.data.dst_addr()
     }
 
     pub fn new() -> Self {
@@ -272,11 +215,11 @@ impl SendEAPoL {
 
     pub fn logoff(&mut self) -> &[u8] {
         self.data.payload_mut().fill(0xa5);
-        self.data.payload_mut()[0] = 0x01;  // Version 1
-        self.data.payload_mut()[1] = 0x02;  // Type Logoff
-        self.data.payload_mut()[2] = 0x00;  // Length 0x0000
+        self.data.payload_mut()[0] = 0x01; // Version 1
+        self.data.payload_mut()[1] = 0x02; // Type Logoff
+        self.data.payload_mut()[2] = 0x00; // Length 0x0000
         self.data.payload_mut()[3] = 0x00;
-        
+
         self.data.as_ref()
     }
 }
