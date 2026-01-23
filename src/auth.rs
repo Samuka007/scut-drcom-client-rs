@@ -1,6 +1,7 @@
 use std::{
     io::ErrorKind,
     net::Ipv4Addr,
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -8,7 +9,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use derive_builder::Builder;
 use smoltcp::wire::EthernetAddress;
 
 use crate::{
@@ -18,6 +18,25 @@ use crate::{
 };
 
 const ETH_FRAME_LEN: usize = 1514;
+
+/// Shared authentication credentials
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+    pub hostname: String,
+    pub hash: String,
+}
+
+impl Credentials {
+    pub fn new(username: String, password: String, hostname: String, hash: String) -> Self {
+        Self {
+            username,
+            password,
+            hostname,
+            hash,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DestMac {
@@ -95,37 +114,16 @@ impl From<std::io::Error> for EAPError {
 }
 
 pub struct Dot1xAuth {
-    // success_8021x: bool,
     channel: Dot1xChannel,
-    // local_mac: EthernetAddress,
-    // local_ip: Ipv4Addr,
-    username: String,
-    password: String,
+    credentials: Rc<Credentials>,
 }
 
 impl Dot1xAuth {
-    pub fn new(
-        interface_name: &str,
-        username: String,
-        password: String,
-    ) -> Result<Self, NetworkError> {
+    pub fn new(interface_name: &str, credentials: Rc<Credentials>) -> Result<Self, NetworkError> {
         let channel = Dot1xChannel::new(interface_name, 1000)?;
-
-        // let local_mac = EthernetAddress::from_bytes(&channel.mac_address()?);
-        // let local_ip = channel.ipv4_address()?;
-
-        // let mut send_pkt = eap::SendEAPoL::new();
-        // send_pkt.set_src_addr(local_mac);
-        // send_pkt.set_dst_addr(DestMac::Multicast.to_addr());
-
         Ok(Self {
-            // success_8021x: false,
             channel,
-            // local_mac,
-            // local_ip,
-            username,
-            password,
-            // send_pkt,
+            credentials,
         })
     }
 
@@ -152,22 +150,14 @@ impl Dot1xAuth {
     }
 
     pub fn try_recv_and_handle_eapol(&mut self) -> Result<(), EAPError> {
-        self.channel
-            .try_recv_and_handle_eapol(&self.username, &self.password)
+        self.channel.try_recv_and_handle_eapol(&self.credentials)
     }
 }
 
-#[derive(Debug, Builder)]
-#[builder(pattern = "owned")]
-#[builder(build_fn(skip))]
 pub struct UdpAuth {
     addr: Ipv4Addr,
-
-    username: String,
-    // password: String,
-    hostname: String,
     mac: EthernetAddress,
-    hash: String,
+    credentials: Rc<Credentials>,
 
     crc_md5_info: [u8; 16],
     tail_info: [u8; 16],
@@ -176,50 +166,45 @@ pub struct UdpAuth {
     send_buf: [u8; ETH_FRAME_LEN],
 
     socket: std::net::UdpSocket,
-    #[builder(default = 0)]
     pkt_id: u8,
 
     misc1_flux: u32,
-    // misc3_flux: u32,
     need_hb: bool,
     base_hb_time: SystemTime,
     last_hb_done: bool,
 }
 
-impl UdpAuthBuilder {
-    pub fn build(self) -> Result<UdpAuth, std::io::Error> {
-        let socket =
-            std::net::UdpSocket::bind((self.addr.unwrap(), DRCOM_SERVER_PORT)).map_err(|e| {
-                log::error!("Failed to bind UDP socket: {}", e);
-                e
-            })?;
+impl UdpAuth {
+    pub fn new(
+        addr: Ipv4Addr,
+        mac: EthernetAddress,
+        credentials: Rc<Credentials>,
+    ) -> Result<Self, std::io::Error> {
+        let socket = std::net::UdpSocket::bind((addr, DRCOM_SERVER_PORT)).map_err(|e| {
+            log::error!("Failed to bind UDP socket: {}", e);
+            e
+        })?;
         socket.set_broadcast(true)?;
-        socket.set_read_timeout(Some(std::time::Duration::from_secs(DRCOM_UDP_RECV_DELAY)))?;
+        socket.set_read_timeout(Some(Duration::from_secs(DRCOM_UDP_RECV_DELAY)))?;
         socket.connect((SERVER_ADDR, DRCOM_SERVER_PORT))?;
 
-        Ok(UdpAuth {
-            addr: self.addr.unwrap(),
+        Ok(Self {
+            addr,
+            mac,
+            credentials,
             socket,
             pkt_id: 0,
-            username: self.username.unwrap(),
-            // password: self.password.unwrap(),
-            hostname: self.hostname.unwrap(),
-            mac: self.mac.unwrap(),
-            hash: self.hash.unwrap(),
             crc_md5_info: [0; 16],
             tail_info: [0; 16],
             recv_buf: [0; ETH_FRAME_LEN],
             send_buf: [0; ETH_FRAME_LEN],
             misc1_flux: 0,
-            // misc3_flux: 0,
             base_hb_time: SystemTime::now(),
             last_hb_done: false,
             need_hb: true,
         })
     }
-}
 
-impl UdpAuth {
     /// Get a mutable reference to the underlying UDP socket.
     pub fn socket_mut(&mut self) -> &mut std::net::UdpSocket {
         &mut self.socket
@@ -249,13 +234,13 @@ impl UdpAuth {
             &mut self.send_buf,
             &self.recv_buf,
             &mut self.crc_md5_info,
-            &self.username,
-            &self.hostname,
+            &self.credentials.username,
+            &self.credentials.hostname,
             self.mac.as_bytes(),
             self.addr,
             DNS_ADDR,
             &VERSION,
-            self.hash.as_bytes(),
+            self.credentials.hash.as_bytes(),
         );
         self.socket.send(&self.send_buf[..len])?;
         Ok(())
@@ -356,13 +341,32 @@ pub struct Auth {
 }
 
 impl Auth {
-    pub fn new(dot1x: Dot1xAuth, udp: UdpAuth) -> Self {
-        Self {
+    pub fn new(interface_name: &str, credentials: Credentials) -> Result<Self, NetworkError> {
+        let credentials = Rc::new(credentials);
+
+        let dot1x = Dot1xAuth::new(interface_name, Rc::clone(&credentials))?;
+
+        let udp = UdpAuth::new(dot1x.local_ip(), dot1x.local_mac(), Rc::clone(&credentials))
+            .map_err(NetworkError::Io)?;
+
+        Ok(Self {
             eap_success: false,
             start_loop: DestMac::Multicast,
             dot1x,
             udp,
-        }
+        })
+    }
+
+    pub fn local_ip(&self) -> Ipv4Addr {
+        self.dot1x.local_ip()
+    }
+
+    pub fn local_mac(&self) -> EthernetAddress {
+        self.dot1x.local_mac()
+    }
+
+    pub fn logoff(&mut self) {
+        self.dot1x.logoff();
     }
 
     /// Single-threaded authentication event loop using timeout-based polling.
@@ -432,13 +436,16 @@ impl Auth {
                             DestMac::Broadcast => self.start_loop = DestMac::RuijieSwitch, // just alias of "if still timeout, just fail"
                             DestMac::RuijieSwitch => return Err(EAPError::Network), // Init failed, error type need refactor
                         }
-                        continue; // skip udp heart beat
                     }
                 }
                 Err(e) => {
                     log::error!("EAPOL error: {:?}", e);
                     return Err(e);
                 }
+            }
+
+            if !self.eap_success {
+                continue; // skip udp heart beat
             }
 
             // Check for UDP packets

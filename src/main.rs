@@ -8,9 +8,7 @@ mod eap;
 mod net;
 mod util;
 
-use auth::{Dot1xAuth, UdpAuthBuilder};
-
-use crate::auth::Auth;
+use auth::{Auth, Credentials};
 
 #[derive(Parser)]
 #[command(name = "scut-drcom-client")]
@@ -68,28 +66,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Using interface: {}", args.iface);
 
-    let mut dot1x = Dot1xAuth::new(&args.iface, args.username.clone(), args.password.clone())?;
+    let credentials = Credentials::new(
+        args.username,
+        args.password,
+        args.hostname,
+        args.hash,
+    );
 
-    log::info!("Local MAC: {}", dot1x.local_mac());
-    log::info!("Local IP: {}", dot1x.local_ip());
+    let mut auth = Auth::new(&args.iface, credentials)?;
+
+    log::info!("Local MAC: {}", auth.local_mac());
+    log::info!("Local IP: {}", auth.local_ip());
 
     // Handle logoff-only mode
     if args.logoff {
-        dot1x.logoff();
+        auth.logoff();
         log::info!("Logoff complete.");
         return Ok(());
     }
-
-    let udp = UdpAuthBuilder::default()
-        .addr(dot1x.local_ip())
-        .mac(dot1x.local_mac())
-        .username(args.username)
-        // .password(args.password)
-        .hostname(args.hostname)
-        .hash(args.hash)
-        .build()?;
-
-    let mut auth = Auth::new(dot1x, udp);
 
     auth.authentication().map_err(|e| {
         log::error!("Authentication failed: {:?}", e);

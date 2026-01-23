@@ -8,7 +8,7 @@ use pnet_datalink::{
 };
 use thiserror::Error;
 
-use crate::auth::EAPError;
+use crate::auth::{Credentials, EAPError};
 use crate::eap::{Code, EAPoL, SendEAPoL, Type, EAPOL_PKT_LEN};
 use crate::util::{AUTH_8021X_LOGOFF_DELAY, MULTICAST_ADDR};
 
@@ -139,11 +139,7 @@ impl Dot1xChannel {
         }
     }
 
-    pub fn try_recv_and_handle_eapol(
-        &mut self,
-        username: &str,
-        password: &str,
-    ) -> Result<(), EAPError> {
+    pub fn try_recv_and_handle_eapol(&mut self, credentials: &Credentials) -> Result<(), EAPError> {
         let ipv4 = self.ipv4_address()?;
         let rx_pkt = match self.rx.next() {
             Ok(packet) => {
@@ -181,13 +177,13 @@ impl Dot1xChannel {
                     log::warn!("DOT1X: NOTIFICATION: {}", rx_eapol.parse_error());
                     return Err(EAPError::Notification);
                 }
-                IDENTITY => send_pkt.identity(rx_eapol.eap_id(), ipv4, username),
+                IDENTITY => send_pkt.identity(rx_eapol.eap_id(), ipv4, &credentials.username),
                 MD5 => send_pkt.md5_response(
                     rx_eapol.eap_id(),
                     ipv4,
                     rx_eapol.md5_challenge(),
-                    username,
-                    password,
+                    &credentials.username,
+                    &credentials.password,
                 ),
                 _ => {
                     log::error!("Unknown EAPOL type: {:?}", rx_eapol.eap_type());
