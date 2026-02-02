@@ -1,53 +1,5 @@
 use std::net::Ipv4Addr;
 
-#[derive(Debug, Clone, Copy)]
-pub enum AuthType {
-    StartAlive = 0x01,
-    ResponseForAlive = 0x02,
-    Info = 0x03,
-    ResponseInfo = 0x04,
-    HeartBeat = 0x0b,
-    ResponseHeartBeat = 0x06,
-    Unknown,
-}
-
-impl From<u8> for AuthType {
-    fn from(val: u8) -> Self {
-        match val {
-            0x01 => AuthType::StartAlive,
-            0x02 => AuthType::ResponseForAlive,
-            0x03 => AuthType::Info,
-            0x04 => AuthType::ResponseInfo,
-            0x0b => AuthType::HeartBeat,
-            0x06 => AuthType::ResponseHeartBeat,
-            _ => AuthType::Unknown,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum MiscType {
-    HeartBeat01Type = 0x01,
-    HeartBeat02Type = 0x02,
-    HeartBeat03Type = 0x03,
-    HeartBeat04Type = 0x04,
-    FileType = 0x06,
-    Unknown,
-}
-
-impl From<u8> for MiscType {
-    fn from(val: u8) -> Self {
-        match val {
-            0x01 => MiscType::HeartBeat01Type,
-            0x02 => MiscType::HeartBeat02Type,
-            0x03 => MiscType::HeartBeat03Type,
-            0x04 => MiscType::HeartBeat04Type,
-            0x06 => MiscType::FileType,
-            _ => MiscType::Unknown,
-        }
-    }
-}
-
 pub fn crc32(data: &[u8]) -> u32 {
     let mut ret: u32 = 0;
     let data_len = data.len();
@@ -58,9 +10,7 @@ pub fn crc32(data: &[u8]) -> u32 {
             u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]])
         } else {
             let mut temp = [0u8; 4];
-            for j in 0..(data_len - i) {
-                temp[j] = data[i + j];
-            }
+            temp[..(data_len - i)].copy_from_slice(&data[i..data_len]);
             u32::from_le_bytes(temp)
         };
         ret ^= chunk;
@@ -95,32 +45,33 @@ pub fn misc_start_alive_setter_immediate() -> [u8; 8] {
 }
 
 /// UDP MISC_RESPONSE_FOR_ALIVE
+#[allow(clippy::too_many_arguments)]
 pub fn misc_info_setter(
     send_data: &mut [u8],
     recv_data: &[u8],
     crc_md5_info: &mut [u8; 16],
-    username: &str, 
+    username: &str,
     hostname: &str,
-    mac: &[u8], 
+    mac: &[u8],
     local_ipaddr: Ipv4Addr,
-    dns_ipaddr: Ipv4Addr, 
-    version: &[u8], 
-    hash: &[u8]
+    dns_ipaddr: Ipv4Addr,
+    version: &[u8],
+    hash: &[u8],
 ) -> usize {
     let mut packetlen = 0;
 
     let header = [
-        0x07,   // Code
-        0x01,   // id
-        0xf4,   // len(包的长度低位，一定要偶数长度的)
-        0x00,   // len(244高位)
-        0x03,   // step 第几步
+        0x07, // Code
+        0x01, // id
+        0xf4, // len(packet length low byte, must be even length)
+        0x00, // len(244 high byte)
+        0x03, // step
     ];
     send_data[..header.len()].copy_from_slice(&header);
     packetlen += header.len();
 
     // uid len
-    send_data[packetlen] = username.len() as u8; // uid len  用户ID长度
+    send_data[packetlen] = username.len() as u8;
     packetlen += 1;
 
     // MAC
@@ -140,8 +91,9 @@ pub fn misc_info_setter(
 
     // crc32 (will be filled later)
     let crc32_mock = [
-        0xc7, 0x2f, 0x31, 0x01, 0x7e /* this byte will be set 0 after crc32 */, 
-        0x00, 0x00, 0x00];
+        0xc7, 0x2f, 0x31, 0x01, 0x7e, /* this byte will be set 0 after crc32 */
+        0x00, 0x00, 0x00,
+    ];
     send_data[packetlen..packetlen + crc32_mock.len()].copy_from_slice(&crc32_mock);
     packetlen += crc32_mock.len();
 
@@ -163,7 +115,6 @@ pub fn misc_info_setter(
     // ignore the second and third 4 bytes (DNS)
     packetlen += 16;
 
-
     // 0x0060
     // unknown
     send_data[packetlen..packetlen + 4].copy_from_slice(&[0x94, 0x00, 0x00, 0x00]);
@@ -177,7 +128,7 @@ pub fn misc_info_setter(
     // os build
     send_data[packetlen..packetlen + 4].copy_from_slice(&[0xf0, 0x23, 0x00, 0x00]);
     packetlen += 4;
-    
+
     // 0x0070
     // os unknown
     send_data[packetlen..packetlen + 4].copy_from_slice(&[0x02, 0x00, 0x00, 0x00]);
@@ -211,10 +162,14 @@ pub fn misc_info_setter(
     packetlen
 }
 
-pub fn misc_heart_beat_01_type_setter(send_data: &mut [u8], drcom_package_id: &mut u8, drcom_misc1_flux: &[u8; 4]) -> usize {
-    let mut packetlen = 0;
+pub fn misc_heart_beat_01_type_setter(
+    send_data: &mut [u8],
+    drcom_package_id: &mut u8,
+    drcom_misc1_flux: &[u8; 4],
+) -> usize {
     send_data[..40].fill(0);
 
+    let mut packetlen = 0;
     send_data[packetlen] = 0x07;
     packetlen += 1;
     send_data[packetlen] = *drcom_package_id;
@@ -234,8 +189,8 @@ pub fn misc_heart_beat_01_type_setter(send_data: &mut [u8], drcom_package_id: &m
 }
 
 pub fn misc_heart_beat_01_type_immediate(
-    drcom_package_id: &mut u8, 
-    drcom_misc1_flux: &[u8; 4]
+    drcom_package_id: &mut u8,
+    drcom_misc1_flux: &[u8; 4],
 ) -> [u8; 40] {
     let mut send_data = [0u8; 40];
     send_data[0] = 0x07;
@@ -246,10 +201,15 @@ pub fn misc_heart_beat_01_type_immediate(
     send_data
 }
 
-pub fn misc_heart_beat_03_type_setter(send_data: &mut [u8], recv_data: &[u8], drcom_package_id: &mut u8, local_ipaddr: Ipv4Addr) -> usize {
-    let mut packetlen = 0;
+pub fn misc_heart_beat_03_type_setter(
+    send_data: &mut [u8],
+    recv_data: &[u8],
+    drcom_package_id: &mut u8,
+    local_ipaddr: Ipv4Addr,
+) -> usize {
     send_data[..40].fill(0);
-    
+
+    let mut packetlen = 0;
     send_data[packetlen] = 0x07;
     packetlen += 1;
     send_data[packetlen] = *drcom_package_id;
@@ -257,25 +217,25 @@ pub fn misc_heart_beat_03_type_setter(send_data: &mut [u8], recv_data: &[u8], dr
     packetlen += 1;
     send_data[packetlen..packetlen + 6].copy_from_slice(&[0x28, 0x00, 0x0b, 0x03, 0xdc, 0x02]);
     packetlen += 6;
-    
+
     send_data[packetlen..packetlen + 2].copy_from_slice(&[0x00, 0x00]);
     packetlen += 2;
     debug_assert_eq!(packetlen, 10);
-    
+
     let mut drcom_misc3_flux = [0u8; 4];
     drcom_misc3_flux.copy_from_slice(&recv_data[16..20]);
 
     send_data[16..20].copy_from_slice(&drcom_misc3_flux);
 
     send_data[28..32].copy_from_slice(&local_ipaddr.octets());
-    
+
     40
 }
 
 pub fn misc_heart_beat_03_type_immediate(
     recv_data: &[u8],
-    drcom_package_id: &mut u8, 
-    local_ipaddr: Ipv4Addr
+    drcom_package_id: &mut u8,
+    local_ipaddr: Ipv4Addr,
 ) -> [u8; 40] {
     let mut send_data = [0u8; 40];
     send_data[0] = 0x07;
@@ -287,7 +247,11 @@ pub fn misc_heart_beat_03_type_immediate(
     send_data
 }
 
-pub fn alive_heart_beat_type_setter(send_data: &mut [u8], crc_md5_info: &[u8; 16], tailinfo: &[u8; 16]) -> usize {
+pub fn alive_heart_beat_type_setter(
+    send_data: &mut [u8],
+    crc_md5_info: &[u8; 16],
+    tailinfo: &[u8; 16],
+) -> usize {
     send_data.fill(0);
     let mut packetlen = 0;
     send_data[packetlen] = 0xff;

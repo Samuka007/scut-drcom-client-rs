@@ -2,13 +2,7 @@ use std::net::Ipv4Addr;
 
 use clap::Parser;
 
-mod auth;
-mod drcom;
-mod eap;
-mod net;
-mod util;
-
-use auth::{Auth, Credentials};
+use scut_drcom_client::{Authenticator, Credentials};
 
 #[derive(Parser)]
 #[command(name = "scut-drcom-client")]
@@ -66,14 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Using interface: {}", args.iface);
 
-    let credentials = Credentials::new(
-        args.username,
-        args.password,
-        args.hostname,
-        args.hash,
-    );
+    let credentials = Credentials::new(args.username, args.password, args.hostname, args.hash);
 
-    let mut auth = Auth::new(&args.iface, credentials)?;
+    let mut auth = Authenticator::new(&args.iface, credentials)?;
 
     log::info!("Local MAC: {}", auth.local_mac());
     log::info!("Local IP: {}", auth.local_ip());
@@ -85,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    auth.authentication().map_err(|e| {
+    auth.authenticate().map_err(|e| {
         log::error!("Authentication failed: {:?}", e);
         Box::new(std::io::Error::new(
             std::io::ErrorKind::Other,

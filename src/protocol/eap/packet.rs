@@ -1,34 +1,13 @@
 use std::net::Ipv4Addr;
 
-// use smoltcp::wire::{EthernetAddress, EthernetFrame};
-use pnet::packet::ethernet::{EthernetPacket, MutableEthernetPacket};
+use pnet::packet::ethernet::{EtherType, EthernetPacket, MutableEthernetPacket};
 use pnet::packet::{MutablePacket, Packet};
 use pnet_datalink::MacAddr;
 
-use crate::net::datalink::EAPOL;
+use super::types::{Code, Type};
+use crate::config::{EAPOL_ETHERTYPE, EAPOL_PKT_LEN};
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum Code {
-    REQUEST = 1,
-    RESPONSE = 2,
-    SUCCESS = 3,
-    FAILURE = 4,
-    H3CDATA = 10,
-    Unknown,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum Type {
-    IDENTITY = 1,
-    NOTIFICATION = 2,
-    MD5 = 4,
-    AVAILABLE = 20,
-    Allocated0x07 = 7,
-    Allocated0x08 = 8,
-    Unknown,
-}
-
-pub const EAPOL_PKT_LEN: usize = 96;
+pub const EAPOL: EtherType = EtherType(EAPOL_ETHERTYPE);
 
 pub struct EAPoL<'a> {
     pub data: EthernetPacket<'a>,
@@ -87,7 +66,6 @@ impl<'a> EAPoL<'a> {
 }
 
 pub struct SendEAPoL<'a> {
-    // pub data: EthernetFrame<[u8; EAPOL_PKT_LEN]>,
     pub data: MutableEthernetPacket<'a>,
 }
 
@@ -125,7 +103,6 @@ impl<'a> SendEAPoL<'a> {
     }
 
     pub fn set_length(&mut self, len: u16) {
-        // TODO: big small endian
         self.data.payload_mut()[16 - 14..].copy_from_slice(&len.to_be_bytes());
         self.data.payload_mut()[20 - 14..].copy_from_slice(&len.to_be_bytes());
     }
@@ -145,7 +122,7 @@ impl<'a> SendEAPoL<'a> {
     }
 
     pub fn set_response_type(&mut self, response_type: u8) {
-        self.data.payload_mut()[1] = response_type; // Type Start
+        self.data.payload_mut()[1] = response_type;
     }
 
     pub fn start(&mut self) {
@@ -157,9 +134,9 @@ impl<'a> SendEAPoL<'a> {
         self.set_response_type(0x00);
 
         // Extensible Authentication Protocol
-        self.set_eap_code(Code::RESPONSE); // Code
-        self.set_eap_id(id); // ID
-        self.set_eap_type(Type::IDENTITY); // Type
+        self.set_eap_code(Code::RESPONSE);
+        self.set_eap_id(id);
+        self.set_eap_type(Type::IDENTITY);
 
         // Username
         let mut pos = 23 - 14;
@@ -189,9 +166,9 @@ impl<'a> SendEAPoL<'a> {
         self.set_response_type(0x00); // Type EAP Packet
 
         // Extensible Authentication Protocol
-        self.set_eap_code(Code::RESPONSE); // Code
-        self.set_eap_id(id); // ID
-        self.set_eap_type(Type::MD5); // Type
+        self.set_eap_code(Code::RESPONSE);
+        self.set_eap_id(id);
+        self.set_eap_type(Type::MD5);
         self.data.payload_mut()[23 - 14] = 0x10; // Value-Size: 16 Bytes
 
         // MD5 Challenge
@@ -208,7 +185,6 @@ impl<'a> SendEAPoL<'a> {
 
         // IP Address
         self.data.payload_mut()[pos..pos + ipaddr.octets().len()].copy_from_slice(&ipaddr.octets());
-        // pos += ipaddr.octets().len();
 
         // Length
         let eap_len: u16 = username.len() as u16 + 31;
@@ -223,17 +199,17 @@ impl<'a> SendEAPoL<'a> {
     }
 }
 
-pub fn eap_err_parse(str: &str) -> &str {
-    if str.starts_with("userid error") {
-        let errcode: i32 = str[12..].trim().parse().unwrap_or(-1);
+pub fn eap_err_parse(s: &str) -> &str {
+    if let Some(rest) = s.strip_prefix("userid error") {
+        let errcode: i32 = rest.trim().parse().unwrap_or(-1);
         return match errcode {
             1 => "Account does not exist.",
             2 | 3 => "Username or password invalid.",
             4 => "This account might be expended.",
-            _ => str,
+            _ => s,
         };
-    } else if str.starts_with("Authentication Fail") {
-        let errcode: i32 = str[19..].trim().parse().unwrap_or(-1);
+    } else if let Some(rest) = s.strip_prefix("Authentication Fail") {
+        let errcode: i32 = rest.trim().parse().unwrap_or(-1);
         return match errcode {
             0 => "Username or password invalid.",
             5 => "This account is suspended.",
@@ -241,16 +217,16 @@ pub fn eap_err_parse(str: &str) -> &str {
             11 => "You are not allowed to perform a radius authentication.",
             16 => "You are not allowed to access the internet now.",
             30 | 63 => "No more time available for this account.",
-            _ => str,
+            _ => s,
         };
-    } else if str.starts_with("AdminReset") {
-        return str;
-    } else if str.contains("Mac, IP, NASip, PORT") {
+    } else if s.starts_with("AdminReset") {
+        return s;
+    } else if s.contains("Mac, IP, NASip, PORT") {
         return "You are not allowed to login using current IP/MAC address.";
-    } else if str.contains("flowover") {
+    } else if s.contains("flowover") {
         return "Data usage has reached the limit.";
-    } else if str.contains("In use") {
+    } else if s.contains("In use") {
         return "This account is in use.";
     }
-    str
+    s
 }
