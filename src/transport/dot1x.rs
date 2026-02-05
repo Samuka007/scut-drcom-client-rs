@@ -106,9 +106,11 @@ impl Dot1xTransport {
     }
 
     pub fn send_start_eapol(&mut self, dest: MacAddr) -> Result<(), AuthError> {
+        let src = self.mac_address()?;
         self.tx
             .build_and_send(1, EAPOL_PKT_LEN, &mut |tx_pkt| {
                 let mut send_pkt = SendEAPoL::new(tx_pkt);
+                send_pkt.data.set_source(src);
                 send_pkt.data.set_destination(dest);
                 send_pkt.start();
             })

@@ -20,10 +20,12 @@ struct Args {
     #[arg(short = 'n', long, default_value = "222.201.130.30")]
     dns: Ipv4Addr,
 
-    #[arg(short = 'H', long, default_value = "DRCOM")]
+    // Keep -H for hash; use -N for hostname.
+    #[arg(short = 'N', long, default_value = "DRCOM")]
     hostname: String,
 
-    #[arg(short = 'h', long, default_value = "")]
+    // Note: clap reserves -h for help; use -H for hash.
+    #[arg(short = 'H', long, default_value = "")]
     hash: String,
 
     #[arg(short = 'D', long)]
