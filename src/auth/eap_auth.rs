@@ -129,6 +129,13 @@ impl EapAuth {
     /// Process one tick: handle packets, manage retry on timeout
     /// Returns the current state after processing
     pub fn tick(&mut self) -> Result<EapState, AuthError> {
+        // Kick off the session by sending EAPOL-Start.
+        if self.state == EapState::Init {
+            let dest = self.dest_mac.to_mac_addr();
+            self.transport.send_start_eapol(dest)?;
+            self.state = EapState::WaitingResponse;
+        }
+
         match self.transport.try_recv_and_handle_eapol(&self.credentials) {
             Ok(()) => {
                 if self.state != EapState::Authenticated {
@@ -144,15 +151,19 @@ impl EapAuth {
             Err(AuthError::Timeout) => {
                 log::debug!("EAP timeout...");
                 if self.state != EapState::Authenticated {
-                    // Try next destination MAC
+                    // Try next destination MAC (and send a new EAPOL-Start on that destination).
                     if let Some(next_mac) = self.dest_mac.next() {
                         log::info!("Trying {} destination...", next_mac);
                         self.dest_mac = next_mac;
+                        self.transport
+                            .send_start_eapol(self.dest_mac.to_mac_addr())?;
+                        self.state = EapState::WaitingResponse;
                         Ok(self.state)
                     } else {
-                        // All MACs exhausted
                         self.state = EapState::Failed;
-                        Err(AuthError::Network("All destination MACs exhausted".to_string()))
+                        Err(AuthError::Network(
+                            "All destination MACs exhausted".to_string(),
+                        ))
                     }
                 } else {
                     Ok(self.state)
